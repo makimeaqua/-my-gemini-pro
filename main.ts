@@ -4,7 +4,7 @@ import { serve } from "https://deno.land/std@0.208.0/http/server.ts";
 
 // --- 配置 ---
 // Gemini API 的基础 URL，注意：已经包含 /v1
-const GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1"; // <-- /v1 已经在这里
+const GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1";
 
 // 1. 我的服务器的认证密钥，用于验证谁能访问我的代理 (SillyTavern 发送)
 const MY_SERVER_SECRET_KEY = Deno.env.get("MY_SERVER_SECRET_KEY");
@@ -202,31 +202,35 @@ async function handler(req: Request): Promise<Response> {
   }
   
   // --- 路径处理逻辑 ---
-  let geminiServicePath = url.pathname; // SillyTavern 发送的原始路径
-  
+  let servicePathSegment = url.pathname; // SillyTavern 发送的原始路径
+
   // 1. 移除路径开头的多余斜杠 (例如，从 "//chat/completions" 变成 "chat/completions")
-  while (geminiServicePath.startsWith('/') && geminiServicePath.length > 1) {
-      geminiServicePath = geminiServicePath.substring(1);
+  while (servicePathSegment.startsWith('/')) {
+      servicePathSegment = servicePathSegment.substring(1);
   }
   // 2. 如果路径是以 "v1/" 开头的，则移除它
-  if (geminiServicePath.startsWith('v1/')) {
-      geminiServicePath = geminiServicePath.substring(3); // 移除 "v1/"
+  if (servicePathSegment.startsWith('v1/')) {
+      servicePathSegment = servicePathSegment.substring(3); // 移除 "v1/"
   }
 
-  // 3. 最终构建的 Gemini API 请求路径，总是以 /v1/ 开头
-  //    GEMINI_API_BASE 已经包含了 "/v1"，所以我们只需要加上处理后的剩余路径
-  const targetUrl = `${GEMINI_API_BASE}${geminiServicePath ? '/' + geminiServicePath : ''}${url.search}`;
+  // 3. 最终构建的目标 URL
+  //    GEMINI_API_BASE 已经包含了 "/v1"
+  //    SillyTavern 发送的实际服务路径 (例如 "chat/completions", "models") 直接拼接到后面
+  const finalTargetUrl = `${GEMINI_API_BASE}${servicePathSegment ? '/' + servicePathSegment : ''}${url.search}`;
 
   console.log(`[${requestId}] 原始 SillyTavern 路径: ${url.pathname}`);
-  console.log(`[${requestId}] 处理后的 Gemini 服务路径: ${geminiServicePath}`); // 这里输出的是 /chat/completions 或 models (不带/v1)
-
+  console.log(`[${requestId}] 处理后的 Gemini 服务路径 (不含 /v1): ${servicePathSegment}`); // 这里输出的是 chat/completions 或 models
+  
   // Gemini API Key 作为 URL 参数传递
   // **重点**：移除 URL 中可能存在的旧的 `key` 参数，然后添加新的 Gemini Key
   url.searchParams.delete("key"); 
   url.searchParams.set("key", configuredGeminiApiKey);
   
-  // 最终构造的 Gemini API 请求 URL
-  // console.log(`[${requestId}] 目标 Gemini API URL: ${targetUrl}`); // 移除了，因为 GEMINI_API_BASE 已经是一个完整 URL
+  // 重新构造 URL，确保 searchParams 被正确应用
+  const finalUrl = new URL(finalTargetUrl);
+  finalUrl.search = url.searchParams.toString(); // 将修改后的 searchParams 应用到最终 URL
+
+  console.log(`[${requestId}] 目标 Gemini API URL: ${finalUrl.toString()}`); 
   console.log(`[${requestId}] Gemini API Key Index: ${GEMINI_AI_KEYS.indexOf(configuredGeminiApiKey) + 1}/${GEMINI_AI_KEYS.length}`);
 
   // --- 准备发送给 Gemini API 的 Headers ---
@@ -279,10 +283,9 @@ async function handler(req: Request): Promise<Response> {
   let geminiErrorDetails: string | null = null; // 用于存储 Gemini API 返回的错误细节
 
   try {
-    const finalTargetUrl = `${GEMINI_API_BASE}${geminiServicePath}${url.search}`; // 构造最终 URL
-    console.log(`[${requestId}] 发送请求到 Gemini API: ${req.method} ${finalTargetUrl}`);
+    console.log(`[${requestId}] 发送请求到 Gemini API: ${req.method} ${finalUrl.toString()}`);
 
-    geminiResponse = await fetch(finalTargetUrl, {
+    geminiResponse = await fetch(finalUrl.toString(), { // 使用 finalUrl.toString()
       method: req.method,
       headers: forwardHeaders,
       body: requestBodyBuffer ? requestBodyBuffer : undefined,
@@ -312,7 +315,7 @@ async function handler(req: Request): Promise<Response> {
       JSON.stringify({
         error: "与 Gemini API 通信时发生错误",
         message: error instanceof Error ? error.message : "未知错误",
-        targetUrl: `https://generativelanguage.googleapis.com/v1${geminiServicePath}${url.search}` // 包含目标 URL 方便调试
+        targetUrl: finalUrl.toString() // 包含目标 URL 方便调试
       }),
       {
         status: 500,
@@ -393,7 +396,7 @@ async function handler(req: Request): Promise<Response> {
                   headers: responseHeaders,
               });
 
-          } else if (geminiResponse.status < _400) { // 修正 typo 
+          } else if (geminiResponse.status < 400) { 
               // **!!! 关键更改 !!!**
               // 仅在非流式、非错误响应时，第一次（也是唯一一次）调用 arrayBuffer()
               responseBodyToReturn = await geminiResponse.arrayBuffer();
@@ -449,4 +452,7 @@ async function handler(req: Request): Promise<Response> {
 
 // --- 启动服务器 ---
 console.log("Gemini API 代理服务器已启动。");
-serve(handler); // Deno Deploy 会自动处理端口和监听
+serve(handler.bind({}), {
+  port: 80, // 明确指定端口 80
+  // 您也可以在这里配置其他选项，例如 Signal for graceful shutdown
+});
