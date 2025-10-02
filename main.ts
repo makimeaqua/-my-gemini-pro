@@ -15,8 +15,8 @@ if (GEMINI_API_KEYS_STR) {
 
 // --- 日志和启动检查 ---
 console.log("=== 服务器启动配置检查 ===");
-console.log(`MY_SERVER_SECRET_KEY 是否已设置: ${MY_SERVER_SECRET_KEY ? '是' : '否'}`);
-console.log(`Gemini API Keys (${GEMINI_API_KEYS_STR ? '包含' : '不包含'}): ${GEMINI_AI_KEYS.length} 个`);
+console.log(`MY_SERVER_SECRET_KEY: ${MY_SERVER_SECRET_KEY ? `[${MY_SERVER_SECRET_KEY.length} 字符]` : '未设置'}`);
+console.log(`Gemini API Keys 数量: ${GEMINI_AI_KEYS.length}`);
 if (GEMINI_AI_KEYS.length > 0) {
   console.log(`Gemini API Keys 长度分布: ${GEMINI_AI_KEYS.map(k => k.length).join(', ')}`);
 }
@@ -33,7 +33,7 @@ function getRandomGeminiApiKey(): string {
   return selectedKey;
 }
 
-// ... handler 函数 ...
+// --- handler 函数 ---
 async function handler(req: Request): Promise<Response> {
   const url = new URL(req.url);
   const requestId = crypto.randomUUID().substring(0, 8);
@@ -50,7 +50,6 @@ async function handler(req: Request): Promise<Response> {
       headers: {
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-        // 确保 client 发送的 header 都有被允许
         "Access-Control-Allow-Headers": "Content-Type, Authorization, x-api-key, x-goog-api-key, x-por-api-key, MY_SERVER_SECRET_KEY",
         "Access-Control-Max-Age": "86400",
       },
@@ -58,73 +57,74 @@ async function handler(req: Request): Promise<Response> {
   }
 
   try {
-    // 检查服务器端配置
-    if (!MY_SERVER_SECRET_KEY || GEMINI_AI_KEYS.length === 0) {
-      console.error(`[${requestId}] 错误：服务器环境变量未正确配置`);
+    // ----- 环境变量检查 -----
+    if (!MY_SERVER_SECRET_KEY) {
+      console.error(`[${requestId}] 错误：环境变量 'MY_SERVER_SECRET_KEY' 未设置`);
       return new Response(
         JSON.stringify({ 
           error: "服务器配置错误",
-          details: { env_configured: {
-            MY_SERVER_SECRET_KEY: !!MY_SERVER_SECRET_KEY,
-            GEMINI_API_KEYS: GEMINI_AI_KEYS.length > 0
-          }}
+          details: { env_configured: { MY_SERVER_SECRET_KEY: false }}
         }),
-        { 
-          status: 500,
-          headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
-        }
+        { status: 500, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }
       );
     }
+    if (GEMINI_AI_KEYS.length === 0) {
+      console.error(`[${requestId}] 错误：环境变量 'GEMINI_API_KEYS' 未设置或为空`);
+      return new Response(
+        JSON.stringify({ 
+          error: "服务器配置错误",
+          details: { env_configured: { GEMINI_API_KEYS: false }}
+        }),
+        { status: 500, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }
+      );
+    }
+    // ----- 环境变量检查结束 -----
 
-    // 1. 验证客户端发送的密钥 (用于访问你的代理)
+    // ----- 1. 验证客户端发送的密钥 (用于访问你的代理) -----
     let clientSecretKey = "";
-    let keySource = "";
+    let keySource = ""; // 记录密钥从哪里获取
+    let foundClientKey = false;
     
-    // 尝试从 x-por-api-key header 获取 (这是 CherryStudio 发送的)
-    const porApiKey = req.headers.get("x-por-api-key");
-    if (porApiKey) {
-      clientSecretKey = porApiKey.trim();
-      keySource = "x-por-api-key header";
-    }
-    // 如果没有，尝试其他 header 或 URL 参数... (按照你的客户端可能发送的顺序)
-    if (!clientSecretKey) { // 检查 x-goog-api-key
-        const googApiKey = req.headers.get("x-goog-api-key");
-        if (googApiKey) {
-            clientSecretKey = googApiKey.trim();
-            keySource = "x-goog-api-key header";
+    // 按照优先级从 Headers 和QueryParams中查找客户端密钥
+    const headersToTry = ["x-por-api-key", "x-goog-api-key", "Authorization", "x-api-key"];
+    
+    // 尝试 Header
+    for (const headerName of headersToTry) {
+      const value = req.headers.get(headerName);
+      if (value) {
+        clientSecretKey = value.trim();
+        keySource = `${headerName} header`;
+        foundClientKey = true;
+        if (headerName === "Authorization" && clientSecretKey.toLowerCase().startsWith("bearer ")) {
+          clientSecretKey = clientSecretKey.substring(7).trim(); // 提取 bearer token
+          keySource = "Authorization Bearer";
         }
+        break; // 找到后就停止往下找
+      }
     }
-    if (!clientSecretKey) { // 检查 Authorization
-        const authHeader = req.headers.get("Authorization");
-        if (authHeader) {
-            if (authHeader.toLowerCase().startsWith("bearer ")) {
-                clientSecretKey = authHeader.substring(7).trim();
-                keySource = "Authorization Bearer";
-            } else {
-                clientSecretKey = authHeader.trim();
-                keySource = "Authorization (direct)";
-            }
-        }
-    }
-     if (!clientSecretKey) { // 检查 x-api-key
-        const xApiKey = req.headers.get("x-api-key");
-        if (xApiKey) {
-            clientSecretKey = xApiKey.trim();
-            keySource = "x-api-key header";
-        }
-    }
-    if (!clientSecretKey) { // 检查 URL 参数 key
+    
+    // 如果在 Header 中没有找到，尝试 URL 参数
+    if (!foundClientKey) {
       const urlKey = url.searchParams.get("key");
       if (urlKey) {
         clientSecretKey = urlKey.trim();
         keySource = "URL parameter";
+        foundClientKey = true;
       }
     }
 
+    console.log(`[${requestId}] ----- 客户端密钥捕获 -----`);
     console.log(`[${requestId}] 客户端密钥来源: ${keySource || '未找到'}`);
+    if (foundClientKey) {
+        console.log(`[${requestId}] 捕获到的客户端密钥 (前8位): ${clientSecretKey.substring(0, 8)}${clientSecretKey.length > 8 ? '...' : ''}`);
+    } else {
+        console.log(`[${requestId}] 未在任何 Header 或 URL 参数中找到客户端密钥`);
+    }
+    console.log(`[${requestId}] ---------------------------`);
     
-    if (!clientSecretKey) {
-      console.log(`[${requestId}] 认证失败：未提供访问代理的密钥`);
+    // 检查是否找到了客户端密钥
+    if (!foundClientKey) {
+      console.log(`[${requestId}] 认证失败：未提供访问代理的密钥 (“${keySource || '未知'}” )`);
       return new Response(
         JSON.stringify({ 
           error: "认证失败：未提供访问代理的密钥",
@@ -134,23 +134,26 @@ async function handler(req: Request): Promise<Response> {
       );
     }
     
+    // 比较客户端密钥和服务端密钥
     if (clientSecretKey !== MY_SERVER_SECRET_KEY) {
-      console.log(`[${requestId}] 认证失败：访问代理的密钥不匹配`);
+      console.log(`[${requestId}] 认证失败：提供的访问代理密钥不匹配`);
       return new Response(
         JSON.stringify({ error: "认证失败：访问代理的密钥无效" }),
         { status: 401, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }
       );
     }
     console.log(`[${requestId}] 访问代理认证成功`);
+    // ----- 客户端密钥验证结束 -----
 
-    // 2. 准备转发给 Gemini API 的请求
+
+    // ----- 2. 准备转发给 Gemini API 的请求 -----
     const selectedGeminiApiKey = getRandomGeminiApiKey();
     const keyIndex = GEMINI_AI_KEYS.indexOf(selectedGeminiApiKey) + 1;
     
     const targetPath = url.pathname;
     // 移除URL中可能带有的key参数，防止干扰
     url.searchParams.delete("key"); 
-    // **重点：** 将 Gemini API Key 添加到 URL 的 `key` 参数中，这是 Gemini API 的标准做法
+    // **重点：** 将 Gemini API Key 添加到 URL 的 `key` 参数中
     url.searchParams.set("key", selectedGeminiApiKey); 
     const targetUrl = `${GEMINI_API_BASE}${targetPath}${url.search}`;
     
@@ -160,7 +163,7 @@ async function handler(req: Request): Promise<Response> {
     const forwardHeaders = new Headers();
     const headersToForward = [
       "Content-Type", "Accept", "User-Agent", "Accept-Language", 
-      "Accept-Encoding", "x-goog-api-client", "X-User-IP" // 加上 X-User-IP 可能会有帮助
+      "Accept-Encoding", "x-goog-api-client", "X-User-IP"
     ];
     
     for (const header of headersToForward) {
@@ -169,9 +172,6 @@ async function handler(req: Request): Promise<Response> {
         forwardHeaders.set(header, value);
       }
     }
-    // **重要：** 确保 `x-por-api-key` 或 `x-goog-api-key` 这些 header **不被转发**给 Gemini API，
-    // 因为我们已经把 Gemini Key 放在了 URL 参数里。Gemini API 期望 Key 在 URL 参数 `key=` 或
-    // header `x-goog-api-key` (如果使用 gcloud CLI 的话)，但这里我们只用 URL 参数。
 
     let body = null;
     if (req.method !== "GET" && req.method !== "HEAD") {
@@ -194,7 +194,7 @@ async function handler(req: Request): Promise<Response> {
     const responseHeaders = new Headers();
     const headersToReturn = [
       "Content-Type", "Content-Length", "Content-Encoding", "Transfer-Encoding",
-      "Date", "Server", // 复制一些标准的响应头
+      "Date", "Server",
     ];
     for (const header of headersToReturn) {
       const value = geminiResponse.headers.get(header);
