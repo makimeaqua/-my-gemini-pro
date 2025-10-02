@@ -201,19 +201,32 @@ async function handler(req: Request): Promise<Response> {
     );
   }
   
-  let geminiServicePath = url.pathname; // 原始路径
-  // 确保 SillyTavern 发送的路径是以 /v1/ 开头的
-  if (!geminiServicePath.startsWith("/v1/")) {
-      console.warn(`[${requestId}] 警告: SillyTavern 发送的路径不符合预期的 OpenAI(/v1/) 格式: ${geminiServicePath}`);
-      if(geminiServicePath.startsWith("/chat/completions") || geminiServicePath.startsWith("/completions")) {
-          console.log(`[${requestId}] 自动处理 SillyTavern 的 /chat/completions 路径，追加 /v1`);
-          geminiServicePath = "/v1" + geminiServicePath;
-      }
+  // --- 路径处理逻辑 ---
+  let geminiServicePath = url.pathname; // SillyTavern 发送的原始路径
+  
+  // 1. 移除路径开头的多余斜杠 (例如，从 "//chat/completions", "/chat/completions", "chat/completions" 变成 "chat/completions")
+  while (geminiServicePath.startsWith('/') && geminiServicePath.length > 1) {
+      geminiServicePath = geminiServicePath.substring(1);
+  }
+  // 移除开头的 /v1/ (如果存在)
+  if (geminiServicePath.startsWith('v1/')) {
+      geminiServicePath = geminiServicePath.substring(3); // 移除 "v1/"
   }
 
+  // 2. 确保最终的路径是以 GEMINI_API_BASE 的格式（即 /v1/）开头
+  //    Gemini API 的 /v1 路径是固定的。
+  //    需要处理的端点例如：/chat/completions, /models 等
+  geminiServicePath = '/v1/' + geminiServicePath;
+
+  console.log(`[${requestId}] 原始 SillyTavern 路径: ${url.pathname}`);
+  console.log(`[${requestId}] 处理后的 Gemini 服务路径: ${geminiServicePath}`);
+
+  // Gemini API Key 作为 URL 参数传递
+  // **重点**：移除 URL 中可能存在的旧的 `key` 参数，然后添加新的 Gemini Key
   url.searchParams.delete("key"); 
   url.searchParams.set("key", configuredGeminiApiKey);
   
+  // 最终构造的 Gemini API 请求 URL
   const targetUrl = `${GEMINI_API_BASE}${geminiServicePath}${url.search}`;
 
   console.log(`[${requestId}] 目标 Gemini API URL: ${targetUrl}`);
@@ -331,16 +344,15 @@ async function handler(req: Request): Promise<Response> {
   responseHeaders.set("X-Gemini-API-Key-Index", `${GEMINI_AI_KEYS.indexOf(configuredGeminiApiKey) + 1}/${GEMINI_AI_KEYS.length}`);
 
   // --- 确定是流式还是非流式响应 ---
-  // Gemini API chat completions 响应通常是 SSE stream (Content-Type: text/event-stream)
-  // 但有时即使 Content-Type 不是 event-stream，也可能返回 chunked 响应，表现为流式。
-  // 结合 Content-Type 和 Transfer-Encoding (chunked) 可以更准确地判断。
   const contentType = geminiResponse.headers.get("Content-Type");
   const transferEncoding = geminiResponse.headers.get("Transfer-Encoding");
-  // 即使 Status >= 400，它仍然可能是流式错误信息
+  // 即使 Status >= 400，它仍然可能是流式错误信息 (例如，Gemini API 返回的SSE错误)
+  // 并且，如果 Content-Type 不是 application/json 并且不是 text/html (通常是错误页面)，也倾向认为是流式
   const isStreaming = 
     contentType?.includes("event-stream") || 
     transferEncoding === "chunked" ||
-    (geminiResponse.status < 400 && !(contentType && contentType.startsWith("application/json"))); // 非 400+ 且 content type 不是 json 的，基本认为是流式
+    (geminiResponse.status < 400 && !(contentType && contentType.startsWith("application/json"))) || // 成功响应，且非 JSON，认为是流式
+    (geminiResponse.status >= 400 && !(contentType && contentType.startsWith("application/json")) && !contentType?.includes("html")); // 错误响应，但 Content-Type 不是 JSON 也不是 HTML，可能是 SSE 错误
 
   try {
       if (isStreaming) {
@@ -358,12 +370,9 @@ async function handler(req: Request): Promise<Response> {
           // --- 处理非流式响应 ---
           console.log(`[${requestId}] 检测到非流式响应 (CT: ${contentType || 'N/A'}, TE: ${transferEncoding})`);
           
-          // 如果之前因为 status >= 400 已经读取了文本，那 geminiResponse.body 就被消耗了。
-          // 此时需要从上面 clone 的错误响应中读取。
-          // 如果没有错误，并且不是流式，才在这里第一次使用 arrayBuffer()
+          // 如果 Gemini API 返回了错误 (status >= 400) 并且我们已经获取了错误详情 (geminiErrorDetails)
+          // 此时，我们应该返回一个标准的 JSON 错误响应，而不是尝试读取已消耗的 body
           if (geminiResponse.status >= 400 && geminiErrorDetails) {
-              // 我们在上面已经通过 clone() 获取了错误详情  geminiErrorDetails
-              // 这里应该构建一个包含错误信息的标准 JSON Response
               const errorPayload = JSON.stringify({
                   error: "Gemini API 返回错误",
                   details: geminiErrorDetails,
