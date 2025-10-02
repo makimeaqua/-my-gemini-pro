@@ -4,7 +4,7 @@ import { serve } from "https://deno.land/std@0.208.0/http/server.ts";
 
 // --- 配置 ---
 // Gemini API 的基础 URL，注意：已经包含 /v1
-const GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1";
+const GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1"; // <-- /v1 已经在这里
 
 // 1. 我的服务器的认证密钥，用于验证谁能访问我的代理 (SillyTavern 发送)
 const MY_SERVER_SECRET_KEY = Deno.env.get("MY_SERVER_SECRET_KEY");
@@ -204,23 +204,21 @@ async function handler(req: Request): Promise<Response> {
   // --- 路径处理逻辑 ---
   let geminiServicePath = url.pathname; // SillyTavern 发送的原始路径
   
-  // 1. 移除路径开头的多余斜杠，以及开头的 "v1/" (如果存在)
-  //    例如： "//chat/completions" -> "chat/completions"
-  //    例如： "/v1/chat/completions" -> "chat/completions"
-  //    例如： "/models" -> "models"
+  // 1. 移除路径开头的多余斜杠 (例如，从 "//chat/completions" 变成 "chat/completions")
   while (geminiServicePath.startsWith('/') && geminiServicePath.length > 1) {
       geminiServicePath = geminiServicePath.substring(1);
   }
+  // 2. 如果路径是以 "v1/" 开头的，则移除它
   if (geminiServicePath.startsWith('v1/')) {
       geminiServicePath = geminiServicePath.substring(3); // 移除 "v1/"
   }
 
-  // 2. 确保最终的路径以 /v1/ 开头，然后加上处理后的剩余部分
-  //    /v1 后面跟着实际的服务路径 (e.g., chat/completions, models)
-  geminiServicePath = '/v1/' + geminiServicePath;
+  // 3. 最终构建的 Gemini API 请求路径，总是以 /v1/ 开头
+  //    GEMINI_API_BASE 已经包含了 "/v1"，所以我们只需要加上处理后的剩余路径
+  const targetUrl = `${GEMINI_API_BASE}${geminiServicePath ? '/' + geminiServicePath : ''}${url.search}`;
 
   console.log(`[${requestId}] 原始 SillyTavern 路径: ${url.pathname}`);
-  console.log(`[${requestId}] 处理后的 Gemini 服务路径: ${geminiServicePath}`);
+  console.log(`[${requestId}] 处理后的 Gemini 服务路径: ${geminiServicePath}`); // 这里输出的是 /chat/completions 或 models (不带/v1)
 
   // Gemini API Key 作为 URL 参数传递
   // **重点**：移除 URL 中可能存在的旧的 `key` 参数，然后添加新的 Gemini Key
@@ -228,9 +226,7 @@ async function handler(req: Request): Promise<Response> {
   url.searchParams.set("key", configuredGeminiApiKey);
   
   // 最终构造的 Gemini API 请求 URL
-  const targetUrl = `${GEMINI_API_BASE}${geminiServicePath}${url.search}`;
-
-  console.log(`[${requestId}] 目标 Gemini API URL: ${targetUrl}`);
+  // console.log(`[${requestId}] 目标 Gemini API URL: ${targetUrl}`); // 移除了，因为 GEMINI_API_BASE 已经是一个完整 URL
   console.log(`[${requestId}] Gemini API Key Index: ${GEMINI_AI_KEYS.indexOf(configuredGeminiApiKey) + 1}/${GEMINI_AI_KEYS.length}`);
 
   // --- 准备发送给 Gemini API 的 Headers ---
@@ -283,12 +279,13 @@ async function handler(req: Request): Promise<Response> {
   let geminiErrorDetails: string | null = null; // 用于存储 Gemini API 返回的错误细节
 
   try {
-    console.log(`[${requestId}] 发送请求到 Gemini API: ${req.method} ${targetUrl}`);
-    geminiResponse = await fetch(targetUrl, {
+    const finalTargetUrl = `${GEMINI_API_BASE}${geminiServicePath}${url.search}`; // 构造最终 URL
+    console.log(`[${requestId}] 发送请求到 Gemini API: ${req.method} ${finalTargetUrl}`);
+
+    geminiResponse = await fetch(finalTargetUrl, {
       method: req.method,
       headers: forwardHeaders,
       body: requestBodyBuffer ? requestBodyBuffer : undefined,
-      // body: req.body, // Deno 的 req.body 是 ReadableStream，直接传可能在某些情况下有问题， ArrayBuffer 更保险
     });
     const responseTime = Date.now() - startTime;
     console.log(`[${requestId}] Gemini API 响应状态: ${geminiResponse.status} (${responseTime}ms)`);
@@ -315,7 +312,7 @@ async function handler(req: Request): Promise<Response> {
       JSON.stringify({
         error: "与 Gemini API 通信时发生错误",
         message: error instanceof Error ? error.message : "未知错误",
-        targetUrl: targetUrl // 包含目标 URL 方便调试
+        targetUrl: `https://generativelanguage.googleapis.com/v1${geminiServicePath}${url.search}` // 包含目标 URL 方便调试
       }),
       {
         status: 500,
@@ -364,6 +361,7 @@ async function handler(req: Request): Promise<Response> {
     (geminiResponse.status < 400 && !(contentType && contentType.startsWith("application/json"))) || // 成功响应，且非 JSON，认为是流式
     (geminiResponse.status >= 400 && !(contentType && contentType.startsWith("application/json")) && !contentType?.includes("html")); // 错误响应，但 Content-Type 不是 JSON 也不是 HTML，可能是 SSE 错误
 
+
   try {
       if (isStreaming) {
           console.log(`[${requestId}] 检测到流式响应 (CT: ${contentType}, TE: ${transferEncoding}), 正在处理...`);
@@ -395,7 +393,7 @@ async function handler(req: Request): Promise<Response> {
                   headers: responseHeaders,
               });
 
-          } else if (geminiResponse.status < 400) {
+          } else if (geminiResponse.status < _400) { // 修正 typo 
               // **!!! 关键更改 !!!**
               // 仅在非流式、非错误响应时，第一次（也是唯一一次）调用 arrayBuffer()
               responseBodyToReturn = await geminiResponse.arrayBuffer();
