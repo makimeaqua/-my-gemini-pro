@@ -201,30 +201,19 @@ async function handler(req: Request): Promise<Response> {
     );
   }
   
-  //SilleyTavern 期望的 OpenAI 兼容端点通常是 /v1/chat/completions
-  //我们的 Base URL (GEMINI_API_BASE) 已经包含了 /v1。
-  //所以，我们只需确保 SillyTavern 发送的路径以 /v1/ 开头，然后将剩下的部分追加到 Gemini API Base URL。
-
   let geminiServicePath = url.pathname; // 原始路径
   // 确保 SillyTavern 发送的路径是以 /v1/ 开头的
   if (!geminiServicePath.startsWith("/v1/")) {
       console.warn(`[${requestId}] 警告: SillyTavern 发送的路径不符合预期的 OpenAI(/v1/) 格式: ${geminiServicePath}`);
-      // 如果 SillyTavern 发送的不是 /v1/chat/completions 而是 /chat/completions, 
-      // 并且您的 Deno 环境是根目录监听，您可能需要调整这里的逻辑. 
-      // 但根据 SillyTavern 的普遍行为，它会发送 /v1/chat/completions。
-      // 如果这里收到 /chat/completions，则追加 /v1
       if(geminiServicePath.startsWith("/chat/completions") || geminiServicePath.startsWith("/completions")) {
           console.log(`[${requestId}] 自动处理 SillyTavern 的 /chat/completions 路径，追加 /v1`);
           geminiServicePath = "/v1" + geminiServicePath;
       }
   }
 
-  // Gemini API Key 作为 URL 参数传递
-  // **重点**：移除 URL 中可能存在的旧的 `key` 参数，然后添加新的 Gemini Key
   url.searchParams.delete("key"); 
   url.searchParams.set("key", configuredGeminiApiKey);
   
-  // 最终构造的 Gemini API 请求 URL
   const targetUrl = `${GEMINI_API_BASE}${geminiServicePath}${url.search}`;
 
   console.log(`[${requestId}] 目标 Gemini API URL: ${targetUrl}`);
@@ -232,45 +221,36 @@ async function handler(req: Request): Promise<Response> {
 
   // --- 准备发送给 Gemini API 的 Headers ---
   const forwardHeaders = new Headers();
-  
-  // 复制 SillyTavern 的 Header，但要排除可能引起冲突的 Header
   const headersToExclude = [
     "host", "connection", "content-length", "transfer-encoding", "upgrade",
-    "sec-websocket-key", "sec-websocket-protocol", "sec-websocket-version", "sec-websocket-extensions", // WebSocket 相关
-    "origin", "access-control-request-headers", "access-control-request-method", // CORS 相关
-    // 密钥相关的 Header，因为我们已将其作为 URL 参数传递
+    "sec-websocket-key", "sec-websocket-protocol", "sec-websocket-version", "sec-websocket-extensions", 
+    "origin", "access-control-request-headers", "access-control-request-method", 
     "authorization", "x-api-key", "x-goog-api-key", "x-por-api-key", "key" 
   ];
 
   for (const [headerName, headerValue] of req.headers.entries()) {
     if (
       !headersToExclude.some(excluded => headerName.toLowerCase() === excluded) &&
-      headerValue !== null // 避免 null 值
+      headerValue !== null 
     ) {
       forwardHeaders.set(headerName, headerValue);
     }
   }
   
-  // 明确设置 Content-Type，如果 SillyTavern 未发送或发送不正确
   if (!forwardHeaders.has("Content-Type") && req.headers.get("Content-Type")) {
     forwardHeaders.set("Content-Type", req.headers.get("Content-Type")!);
   } else if (!forwardHeaders.has("Content-Type")) {
-      forwardHeaders.set("Content-Type", "application/json"); // 默认 JSON
+      forwardHeaders.set("Content-Type", "application/json"); 
   }
-  // Gemini API 可能需要一些特定的 Header，例如 x-goog-api-client
-  // forwardHeaders.set("x-goog-api-client", "gal/1.0 gdcl/2023.09.26"); // 可选，根据需要添加
 
   // --- 准备请求体 ---
   let requestBodyBuffer: ArrayBuffer | null = null;
-  if (req.body) { // 检查 req.body 是否存在
+  if (req.body) { 
     try {
       requestBodyBuffer = await req.arrayBuffer();
       console.log(`[${requestId}] 请求体大小: ${requestBodyBuffer.byteLength} bytes`);
-      // 如果需要，可以在这里打印一部分请求体用于调试
-      // console.log(`[${requestId}] 请求体 (前100字节): ${new TextDecoder().decode(requestBodyBuffer.slice(0, 100))}`);
     } catch (e) {
       console.error(`[${requestId}] 读取请求体时发生错误:`, e);
-      // 如果读取请求体失败，也返回错误
       return new Response(
         JSON.stringify({ error: "无法读取请求体", message: e.message }),
         { status: 400, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": allowedOrigin } }
@@ -282,13 +262,16 @@ async function handler(req: Request): Promise<Response> {
 
   // --- 发送请求到 Gemini API ---
   let geminiResponse: Response;
+  let responseBodyToReturn: ArrayBuffer | ReadableStream | null = null; // 用于存储最终要返回的响应体
+  let consumeError: Error | null = null; // 用于存储读取响应体时可能发生的错误
+  let geminiErrorDetails: string | null = null; // 用于存储 Gemini API 返回的错误细节
+
   try {
     console.log(`[${requestId}] 发送请求到 Gemini API: ${req.method} ${targetUrl}`);
     geminiResponse = await fetch(targetUrl, {
       method: req.method,
       headers: forwardHeaders,
       body: requestBodyBuffer ? requestBodyBuffer : undefined,
-      // body: req.body, // Deno 的 req.body 是 ReadableStream，直接传可能在某些情况下有问题， ArrayBuffer 更保险
     });
     const responseTime = Date.now() - startTime;
     console.log(`[${requestId}] Gemini API 响应状态: ${geminiResponse.status} (${responseTime}ms)`);
@@ -296,10 +279,16 @@ async function handler(req: Request): Promise<Response> {
     // 检查 Gemini API 的响应状态码
     if (geminiResponse.status >= 400) {
         try {
-            const errorBody = await geminiResponse.text();
-            console.error(`[${requestId}] Gemini API 错误详情: Status ${geminiResponse.status}, Response: "${errorBody.substring(0, 500)}"`);
+            // **!!! 关键更改 !!!**
+            // 使用 clone() 来创建一个响应的副本，这样我们就可以安全地读取它，
+            // 而不会“消耗”原始的 geminiResponse，以便后续的流式/非流式处理。
+            const errorResponseClone = geminiResponse.clone(); 
+            const errorBody = await errorResponseClone.text();
+            geminiErrorDetails = `Status ${geminiResponse.status}, Response: "${errorBody.substring(0, 500)}"`;
+            console.error(`[${requestId}] Gemini API 错误详情: ${geminiErrorDetails}`);
         } catch (e) {
-            console.error(`[${requestId}] Gemini API 错误响应 (无法读取文本): Status ${geminiResponse.status}, Body size: ${geminiResponse.headers.get("content-length") || "unknown"}`);
+            geminiErrorDetails = `Status ${geminiResponse.status}, Body size: ${geminiResponse.headers.get("content-length") || "unknown"} (unable to read text)`;
+            console.error(`[${requestId}] Gemini API 错误响应 (无法读取文本): ${geminiErrorDetails}`);
         }
     }
 
@@ -309,7 +298,7 @@ async function handler(req: Request): Promise<Response> {
       JSON.stringify({
         error: "与 Gemini API 通信时发生错误",
         message: error instanceof Error ? error.message : "未知错误",
-        targetUrl: targetUrl // 包含目标 URL 方便调试
+        targetUrl: targetUrl 
       }),
       {
         status: 500,
@@ -322,11 +311,10 @@ async function handler(req: Request): Promise<Response> {
   }
 
   // --- 准备返回给客户端 (SillyTavern) 的响应 ---
-  // 复制 Gemini API 的响应头，并添加 CORS 和调试信息
   const responseHeaders = new Headers();
   const headersToReturn = [
     "Content-Type", "Cache-Control", "Content-Encoding", "Transfer-Encoding",
-    "Date", "Server", "Content-Length" // 复制一些标准的响应头
+    "Date", "Server", "Content-Length" 
   ];
   for (const header of headersToReturn) {
     const value = geminiResponse.headers.get(header);
@@ -335,53 +323,108 @@ async function handler(req: Request): Promise<Response> {
     }
   }
   
-  // 添加 CORS Headers
   responseHeaders.set("Access-Control-Allow-Origin", allowedOrigin);
   responseHeaders.set("Access-Control-Allow-Headers", "Content-Type, Authorization, x-api-key, x-goog-api-key, x-por-api-key, MY_SERVER_SECRET_KEY");
   responseHeaders.set("Access-Control-Allow-Credentials", "true");
 
-  // 添加调试 Headers
   responseHeaders.set("X-Request-ID", requestId);
   responseHeaders.set("X-Gemini-API-Key-Index", `${GEMINI_AI_KEYS.indexOf(configuredGeminiApiKey) + 1}/${GEMINI_AI_KEYS.length}`);
 
-  // --- 处理流式响应 ---
-  // Gemini API chat completions 响应通常是 SSE stream
+  // --- 确定是流式还是非流式响应 ---
+  // Gemini API chat completions 响应通常是 SSE stream (Content-Type: text/event-stream)
+  // 但有时即使 Content-Type 不是 event-stream，也可能返回 chunked 响应，表现为流式。
+  // 结合 Content-Type 和 Transfer-Encoding (chunked) 可以更准确地判断。
   const contentType = geminiResponse.headers.get("Content-Type");
-  if (
+  const transferEncoding = geminiResponse.headers.get("Transfer-Encoding");
+  // 即使 Status >= 400，它仍然可能是流式错误信息
+  const isStreaming = 
     contentType?.includes("event-stream") || 
-    geminiResponse.headers.get("Transfer-Encoding") === "chunked" || // chunked 响应也常常是流式
-    url.pathname.endsWith("/stream") // 显式要求 stream 的路径 (如果 SillyTavern 有这种模式)
-  ) {
-    console.log(`[${requestId}] 检测到流式响应 (Content-Type: ${contentType}), 正在处理...`);
-    
-    // Gemini API 的 SSE 响应是以 'data: ...\n\n' 格式的。
-    // Deno 的 fetch 返回的 ReadableStream 已经包含了这些数据。
-    // 我们只需要确保 Content-Type 设置为 text/event-stream
-    responseHeaders.set("Content-Type", "text/event-stream");
-    responseHeaders.set("Cache-Control", "no-cache"); // 缓存控制
-    responseHeaders.set("Connection", "keep-alive"); // 保持连接
+    transferEncoding === "chunked" ||
+    (geminiResponse.status < 400 && !(contentType && contentType.startsWith("application/json"))); // 非 400+ 且 content type 不是 json 的，基本认为是流式
 
-    return new Response(geminiResponse.body, {
-      status: geminiResponse.status,
-      headers: responseHeaders,
-    });
-  }
-
-  // --- 处理非流式响应 ---
-  // 如果不是流式响应，则读取整个响应体
-  let responseBody: ArrayBuffer;
   try {
-      responseBody = await geminiResponse.arrayBuffer();
-      console.log(`[${requestId}] 非流式响应体大小: ${responseBody.byteLength} bytes`);
+      if (isStreaming) {
+          console.log(`[${requestId}] 检测到流式响应 (CT: ${contentType}, TE: ${transferEncoding}), 正在处理...`);
+          responseHeaders.set("Content-Type", "text/event-stream"); // 明确设置为 SSE
+          responseHeaders.set("Cache-Control", "no-cache"); 
+          responseHeaders.set("Connection", "keep-alive"); 
+
+          // **!!! 关键更改 !!!**
+          // 对于流式响应，直接返回 geminiResponse.body (ReadableStream)
+          // 确保这个 body 没有在其他地方被消耗
+          responseBodyToReturn = geminiResponse.body; 
+
+      } else {
+          // --- 处理非流式响应 ---
+          console.log(`[${requestId}] 检测到非流式响应 (CT: ${contentType || 'N/A'}, TE: ${transferEncoding})`);
+          
+          // 如果之前因为 status >= 400 已经读取了文本，那 geminiResponse.body 就被消耗了。
+          // 此时需要从上面 clone 的错误响应中读取。
+          // 如果没有错误，并且不是流式，才在这里第一次使用 arrayBuffer()
+          if (geminiResponse.status >= 400 && geminiErrorDetails) {
+              // 我们在上面已经通过 clone() 获取了错误详情  geminiErrorDetails
+              // 这里应该构建一个包含错误信息的标准 JSON Response
+              const errorPayload = JSON.stringify({
+                  error: "Gemini API 返回错误",
+                  details: geminiErrorDetails,
+                  requestId: requestId,
+              });
+              responseHeaders.set("Content-Type", "application/json");
+              responseBodyToReturn = new TextEncoder().encode(errorPayload); // 将错误信息编码为 ArrayBuffer
+              return new Response(responseBodyToReturn, {
+                  status: geminiResponse.status, // 使用 Gemini API 返回的状态码
+                  headers: responseHeaders,
+              });
+
+          } else if (geminiResponse.status < 400) {
+              // **!!! 关键更改 !!!**
+              // 仅在非流式、非错误响应时，第一次（也是唯一一次）调用 arrayBuffer()
+              responseBodyToReturn = await geminiResponse.arrayBuffer();
+              console.log(`[${requestId}] 非流式响应体: ${(<ArrayBuffer>responseBodyToReturn).byteLength} bytes`);
+          } else {
+              // 理论上，如果 status < 400 且不是流式，一定会走 arrayBuffer()
+              // 如果走到这里，可能是一个罕见的逻辑分支，输出警告
+              console.warn(`[${requestId}] **警告：** 遇到未知非流式响应处理情况 (Status: ${geminiResponse.status}, CT: ${contentType})`);
+              // 尝试读取，以防万一
+              responseBodyToReturn = await geminiResponse.arrayBuffer();
+              console.log(`[${requestId}] 非流式响应体 (尝试读取): ${(<ArrayBuffer>responseBodyToReturn).byteLength} bytes`);
+          }
+      }
+      
   } catch (e) {
-      console.error(`[${requestId}] 读取非流式响应体时发生错误:`, e);
-      return new Response(
-          JSON.stringify({ error: "服务器内部错误 - 无法读取 Gemini API 响应", message: e.message }),
-          { status: 500, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": allowedOrigin } }
-      );
+      console.error(`[${requestId}] 处理 Gemini API 响应时发生错误 (读取body):`, e);
+      consumeError = e; // 记录错误
   }
 
-  return new Response(responseBody, {
+  // --- 返回最终响应 ---
+  if (consumeError) {
+    // 如果在 try-catch 块中读取响应体时发生错误，返回内部服务器错误
+    return new Response(
+        JSON.stringify({ 
+            error: "服务器内部错误 - 无法处理 Gemini API 响应", 
+            message: consumeError.message,
+            requestId: requestId,
+            geminiErrorDetails: geminiErrorDetails // 包含之前获取的 Gemini 错误信息
+        }),
+        { 
+            status: 500, 
+            headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": allowedOrigin } 
+        }
+    );
+  }
+
+  // !!! 确保 responseBodyToReturn 非空 !!!
+  if (!responseBodyToReturn) {
+    console.error(`[${requestId}] **致命错误：** responseBodyToReturn 为空！`);
+    return new Response(
+        JSON.stringify({ error: "服务器内部错误 - 响应体生成失败", requestId: requestId }),
+        { status: 500, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": allowedOrigin } }
+    );
+  }
+  
+  // 如果是流式，responseBodyToReturn 是 ReadableStream
+  // 如果是非流式，responseBodyToReturn 是 ArrayBuffer
+  return new Response(responseBodyToReturn, {
     status: geminiResponse.status,
     headers: responseHeaders,
   });
